@@ -1,0 +1,93 @@
+name: Exchange transaction record
+
+# Keeps the exchange's own record of the account's transactions for the month just
+# ended: the export the exchange generates on request, apart from the responses the
+# daily workflow retrieves. It is the third source of the monthly reconciliation
+# (Methodology, section 5). The file is kept as received, encrypted, in the private
+# repository, with the SHA-256 of the unencrypted file. The exchange allows five
+# such exports a month; this uses one.
+#
+# The log prints statuses, dates and file names only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "The month, YYYY-MM (the month before this one if left empty; a month not yet ended is taken to now)"
+        required: false
+        default: ""
+  schedule:
+    # The second day, not the first: an export requested in the afternoon UTC
+    # held the account's transactions only up to the day before, so an export asked
+    # for just after a month ends may lack its last day.
+    - cron: "0 1 2 * *"
+
+permissions:
+  contents: read
+
+# Shared with the daily record, so that the two never write to the private repository at once.
+concurrency:
+  group: daily-record
+  cancel-in-progress: false
+
+env:
+  # Every commit says which run made it and the code the run ran, so that each
+  # commit of the record leads to its run's public log.
+  TRAILER: "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}\nCode: ${{ github.sha }}"
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: reouthq/record-raw
+          ssh-key: ${{ secrets.TRACK_RAW_DEPLOY_KEY }}
+          path: private
+
+      - name: Collect the export
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          # The exchange's API is reached through the proxy; the file itself is
+          # served from a content network and fetched directly (transactions.py).
+          HTTPS_PROXY: ${{ secrets.TRACK_PROXY_URL }}
+          ASKED: ${{ github.event.inputs.month }}
+        run: python3 transactions.py --month "$ASKED" --out "$RUNNER_TEMP/export"
+
+      - name: Keep the export
+        env:
+          PASS: ${{ secrets.TRACK_RAW_PASSPHRASE }}
+        run: |
+          mkdir -p private/exchange
+          for file in "$RUNNER_TEMP"/export/*.zip; do
+            name=$(basename "$file")
+            (cd "$RUNNER_TEMP/export" && sha256sum "$name") > "private/exchange/$name.sha256"
+            openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:PASS \
+              -in "$file" -out "private/exchange/$name.enc"
+            shred -u "$file"
+            echo "kept: exchange/$name.enc"
+          done
+          cd private
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add exchange
+          git commit --quiet -m "exchange: the exchange's transaction record, $(ls exchange/*.enc | tail -1 | xargs basename)" -m "$TRAILER"
+          git push --quiet
+
+      # A failed run is told to the operator at once, so that a missed day is not found
+      # days later. The notice names the workflow and links its log; nothing more.
+      - name: Tell the operator the run failed
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC is not set"; exit 0; fi
+          curl -fsS -m 20 -H "Title: $WORKFLOW failed" -H "Priority: high" -H "Tags: warning" \
+            -d "$RUN_URL" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null

@@ -1,0 +1,44 @@
+name: Watch
+
+# The failure notice in each workflow fires only when a run fails. This checks the
+# other case once a day: that the workflow ran at all, since a scheduled run can be
+# skipped without failing. It looks for a successful run of the daily record in the last 30 hours, and, once the record has begun, a published day no older than two days.
+on:
+  schedule:
+    - cron: "0 17 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          problem=""
+          last=$(gh api "repos/${{ github.repository }}/actions/workflows/pull.yml/runs?status=success&per_page=1" --jq '.workflow_runs[0].created_at // empty')
+          if [ -z "$last" ]; then
+            problem="no successful run of the daily record found"
+          elif [ $(( $(date -u +%s) - $(date -u -d "$last" +%s) )) -gt 108000 ]; then
+            problem="the last successful run of the daily record was at $last"
+          fi
+          # Once the record has begun, its latest published day is yesterday or the day before.
+          if [ -f data/equity_daily.csv ] && [ "$(wc -l < data/equity_daily.csv)" -gt 1 ]; then
+            latest=$(tail -1 data/equity_daily.csv | cut -d, -f1)
+            if [ "$latest" \< "$(date -u -d "2 days ago" +%F)" ]; then problem="${problem:+$problem; }the latest published day is $latest"; fi
+          fi
+          if [ -z "$problem" ]; then echo "fresh"; exit 0; fi
+          echo "$problem"
+          if [ -n "$NTFY_TOPIC" ]; then
+            curl -fsS -m 20 -H "Title: ${{ github.repository }}: stale" -H "Priority: high" -H "Tags: warning" \
+              -d "$problem" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
+          fi
+          exit 1

@@ -1,0 +1,152 @@
+name: Monthly report
+
+# Publishes the report of the month just ended: its Markdown, the PDF rendered
+# from it, the manifest of both and the manifest's proof (Methodology, section 5).
+# It runs at 00:00 UTC on the third day of the month. If the month cannot be
+# reported then, for instance because its last day is not yet published, it runs
+# again on each following day to the seventh; a report published after the third
+# is an incident, which reout enters in the incident log.
+#
+# Until the record begins this is a rehearsal: the report is made from the record
+# the daily rehearsal keeps in the private repository, and committed there. From
+# record inception it is made in, and committed to, this repository.
+#
+# The log prints dates and file names only.
+
+on:
+  workflow_dispatch:
+    inputs:
+      month:
+        description: "The month to report, YYYY-MM (the month before this one if left empty)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 0 3-7 * *"
+
+# A report of a month of the record is committed to this repository.
+permissions:
+  contents: write
+
+# Shared with the daily record, so that the two never write to the private repository at once.
+concurrency:
+  group: daily-record
+  cancel-in-progress: false
+
+env:
+  # Every commit says which run made it and the code the run ran, so that each
+  # commit of the record leads to its run's public log.
+  TRAILER: "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}\nCode: ${{ github.sha }}"
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: reouthq/record-raw
+          ssh-key: ${{ secrets.TRACK_RAW_DEPLOY_KEY }}
+          path: private
+
+      - name: Choose the month
+        env:
+          ASKED: ${{ github.event.inputs.month }}
+          INCEPTION: ${{ vars.RECORD_INCEPTION }}
+        run: |
+          month="$ASKED"
+          if [ -z "$month" ]; then
+            month=$(python3 -c 'import datetime as d
+          print((d.datetime.now(d.timezone.utc).replace(day=1) - d.timedelta(days=1)).strftime("%Y-%m"))')
+          fi
+          if ! printf '%s' "$month" | grep -Eq '^[0-9]{4}-(0[1-9]|1[0-2])$'; then
+            echo "not a month: $month"
+            exit 1
+          fi
+          echo "MONTH=$month" >> "$GITHUB_ENV"
+          # A month from the record's first on is the record's (RECORD_INCEPTION, set at
+          # pre-registration); an earlier one is a rehearsal, kept in the private repository.
+          if [ -n "$INCEPTION" ] && [ ! "$month" \< "${INCEPTION:0:7}" ]; then
+            reports=reports
+            echo "MODE=record" >> "$GITHUB_ENV"
+          else
+            reports=private/shakedown/reports
+            echo "MODE=rehearsal" >> "$GITHUB_ENV"
+          fi
+          if [ -e "$reports/$month.md" ]; then
+            echo "the report of $month is already published"
+            echo "PUBLISHED=yes" >> "$GITHUB_ENV"
+          else
+            echo "the report of $month is to be published"
+          fi
+
+      - name: Install the OpenTimestamps client
+        if: env.PUBLISHED != 'yes'
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ots"
+          "$RUNNER_TEMP/ots/bin/pip" install --quiet \
+            opentimestamps-client==0.7.2 opentimestamps==0.4.5 python-bitcoinlib==0.12.2
+          "$RUNNER_TEMP/ots/bin/pip" show opentimestamps-client | grep '^Version'
+
+      - name: Produce the report
+        if: env.PUBLISHED != 'yes'
+        run: |
+          if [ "$MODE" = record ]; then
+            # The record is this repository: the report is written into it.
+            python3 tools/monthly_report.py --month "$MONTH" --root . --ots "$RUNNER_TEMP/ots/bin/ots"
+            exit 0
+          fi
+          # The rehearsal's record holds the data and its manifests; the documents
+          # and registers the report quotes are this repository's.
+          root="$RUNNER_TEMP/record"
+          mkdir -p "$root/attest" "$root/reports"
+          cp RISK_LIMITS.md CHANGELOG.md "$root/"
+          cp attest/*.md "$root/attest/"
+          cp -R private/shakedown/data "$root/data"
+          cp private/shakedown/attest/*.sha256 private/shakedown/attest/*.sha256.ots "$root/attest/"
+          if [ -d private/shakedown/reports ]; then
+            cp -R private/shakedown/reports/. "$root/reports/"
+          fi
+          python3 tools/monthly_report.py --month "$MONTH" --root "$root" --ots "$RUNNER_TEMP/ots/bin/ots"
+          mkdir -p private/shakedown/reports
+          for suffix in md pdf sha256 sha256.ots; do
+            cp "$root/reports/$MONTH.$suffix" private/shakedown/reports/
+          done
+
+      - name: Commit the report
+        if: env.PUBLISHED != 'yes'
+        run: |
+          if [ "$MODE" = record ]; then
+            dir=reports; kind=report
+          else
+            cd private; dir=shakedown/reports; kind=shakedown
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for suffix in md pdf sha256 sha256.ots; do
+            git add "$dir/$MONTH.$suffix"
+          done
+          git commit --quiet -m "$kind: the monthly report of $MONTH" -m "$TRAILER"
+          git push --quiet
+
+      - name: Note a report published after the third day
+        if: env.PUBLISHED != 'yes'
+        run: |
+          if [ "$(date -u +%d)" != "03" ]; then
+            echo "::warning::the report of $MONTH was published on $(date -u +%Y-%m-%d), not on the third day: enter the delay in the incident log"
+          fi
+
+      # A failed run is told to the operator at once, so that a missed day is not found
+      # days later. The notice names the workflow and links its log; nothing more.
+      - name: Tell the operator the run failed
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC is not set"; exit 0; fi
+          curl -fsS -m 20 -H "Title: $WORKFLOW failed" -H "Priority: high" -H "Tags: warning" \
+            -d "$RUN_URL" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null

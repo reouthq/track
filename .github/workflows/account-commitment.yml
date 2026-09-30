@@ -1,0 +1,40 @@
+name: Commitment for an account
+
+# Run by hand when an account is registered. Prints the commitment the account
+# register carries for the account the key belongs to, so that the record can
+# refuse a key that points anywhere else (pull.py, check_account).
+#
+# The log prints the commitment alone. It is public by design; the identifiers
+# it commits to are account data and never leave the retained copies.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  commitment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: reouthq/record-raw
+          ssh-key: ${{ secrets.TRACK_RAW_DEPLOY_KEY }}
+          path: private
+
+      - name: Compute the commitment
+        env:
+          PASS: ${{ secrets.TRACK_RAW_PASSPHRASE }}
+          TRACK_ACCOUNT_SALT: ${{ secrets.TRACK_ACCOUNT_SALT }}
+        run: |
+          umask 077
+          printf '%s' "$PASS" > "$RUNNER_TEMP/passphrase"
+          python3 tools/account_commitment.py \
+            --archive private/account/*.json.enc \
+            --passphrase-file "$RUNNER_TEMP/passphrase"
+          shred -u "$RUNNER_TEMP/passphrase"

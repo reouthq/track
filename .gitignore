@@ -1,0 +1,7 @@
+# nothing secret ever lives here; keys are GitHub Secrets only
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
+# the OpenTimestamps client's backup of a proof it has upgraded
+*.ots.bak

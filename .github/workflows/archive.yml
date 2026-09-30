@@ -1,0 +1,238 @@
+name: Archive account records
+
+# Keeps the exchange's own records of the account before they expire.
+# The exchange retains its daily record of an account for thirty days, and its
+# income ledger and fills for a limited time only, so a record not copied in
+# time is gone for good. This job copies all three every day, encrypts the copy
+# and commits it. The records are fetched by fetch.py, which the publishing
+# workflow uses too.
+#
+# It only preserves; it computes and publishes nothing. The record itself is
+# produced by pull.py, which reads these same sources.
+#
+# The copy is encrypted with a passphrase held outside this repository, and it
+# is committed to the private repository, not to this one. Even encrypted, a
+# copy of the account's records does not belong in a public history: it would
+# stay there if the passphrase were ever exposed. The ledger of fingerprints
+# stays private too, since the fingerprint of a day without trades or income
+# is always the same and would show on which days the account was active. The
+# SHA-256 of the unencrypted copy is committed beside it, so that a later
+# decryption can be checked against it.
+#
+# The log prints dates and file names only: no balance, no fill, and no count
+# or size that would show how active the account is.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: archive
+  cancel-in-progress: false
+
+env:
+  # Every commit says which run made it and the code the run ran, so that each
+  # commit of the record leads to its run's public log.
+  TRAILER: "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}\nCode: ${{ github.sha }}"
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: reouthq/record-raw
+          ssh-key: ${{ secrets.TRACK_RAW_DEPLOY_KEY }}
+          path: private
+
+      - name: Fetch the exchange's records
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          # The exchange refuses GitHub's runners, which are in the United
+          # States. Its API is reached through a proxy that relays TLS tunnels
+          # and cannot read or alter them.
+          HTTPS_PROXY: ${{ secrets.TRACK_PROXY_URL }}
+        run: python3 fetch.py --out /tmp/archive.json
+
+      - name: Fingerprint the closed days
+        working-directory: private
+        run: |
+          python3 - <<'EOF'
+          import datetime as dt, hashlib, json, os
+
+
+          doc = json.load(open("/tmp/archive.json"))
+          vos = json.loads(doc["daily_records_response"]).get("snapshotVos") or []
+          income_bodies = doc["income_responses"]
+          trade_bodies = doc["trade_responses"]
+
+          # A day the exchange has closed must never change afterwards. Keep the
+          # fingerprint of each closed day the first time it is seen and compare
+          # every later fetch against it, so a revision of history is noticed on
+          # the next run instead of years later. Hashes only: no balance is kept
+          # here, and this file stays in the clear so it can be checked.
+          #
+          # What must not change is what the figures are computed from: the wallet
+          # balances, every position that holds a quantity, the income ledger and
+          # the fills. Two parts are left out because the exchange revises them
+          # after publishing a day and neither reaches a figure: an empty position
+          # entry, which moves nothing, and the margin balance, whose unrealized
+          # P&L is marked at a different hour from the rest of the record, which is
+          # why the record is not computed from it (pull.py, valuation). A change
+          # of the raw record alone is written down with the time it was noticed,
+          # once, and does not stop the job.
+          SETTLE_DAYS = 3                     # days before a record stops being completed
+          today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
+          # The exchange completes a daily record after handing it out: the position held at the
+          # valuation point has been seen to appear in the record a day later. A day is therefore fingerprinted only once it has been settled
+          # for this long, so that the first sighting is of the finished record and
+          # a later change is a revision of history rather than the exchange
+          # catching up.
+          settled = (dt.datetime.now(dt.timezone.utc)
+                     - dt.timedelta(days=SETTLE_DAYS)).strftime("%Y-%m-%d")
+          noticed = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          def digest(obj):
+              return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+          def day_of(ms):
+              return dt.datetime.utcfromtimestamp(ms / 1000).strftime("%Y-%m-%d")
+
+          def used(v):
+              """The part of a daily record that the figures are computed from."""
+              data = (v or {}).get("data") or {}
+              return {
+                  "assets": sorted([a.get("asset", ""), a.get("walletBalance", "")]
+                                   for a in data.get("assets") or []),
+                  "positions": sorted([p.get("symbol", ""), p.get("positionAmt", ""),
+                                       p.get("entryPrice", ""), p.get("markPrice", ""),
+                                       p.get("unRealizedProfit", "")]
+                                      for p in data.get("position") or []
+                                      if float(p.get("positionAmt") or 0) != 0),
+              }
+
+          records_by_day, income_by_day, fills_by_day = {}, {}, {}
+          for v in vos:
+              records_by_day[day_of(v["updateTime"])] = v
+          for body in income_bodies:
+              for e in json.loads(body):
+                  income_by_day.setdefault(day_of(e["time"]), {})[
+                      (str(e.get("tranId")), e["incomeType"], e["time"])] = e
+          for body in trade_bodies:
+              for t in json.loads(body):
+                  fills_by_day.setdefault(day_of(t["time"]), {})[str(t["id"])] = t
+
+          def ordered(by_day, d):
+              items = by_day.get(d, {})
+              return [items[k] for k in sorted(items)]
+
+          closed = sorted(d for d in set(records_by_day) | set(income_by_day) | set(fills_by_day)
+                          if d < settled)
+          seen = {d: {"valuation": digest(used(records_by_day.get(d))),
+                      "income": digest(ordered(income_by_day, d)),
+                      "fills": digest(ordered(fills_by_day, d))}
+                  for d in closed}
+          raw = {d: digest(records_by_day.get(d)) for d in closed}
+
+          os.makedirs("archive", exist_ok=True)
+          ledger = "archive/days.json"
+          known = json.load(open(ledger)) if os.path.exists(ledger) else {}
+          for fp in known.values():
+              # A ledger written before this rule kept the raw record as "records".
+              if "records" in fp and "raw" not in fp:
+                  fp["raw"] = fp.pop("records")
+
+          # Drift is a part the figures are computed from that was fingerprinted
+          # before and differs now. A part seen for the first time is recorded.
+          drift = sorted(d for d, fp in seen.items()
+                         if any(k in known.get(d, {}) and known[d][k] != h for k, h in fp.items()))
+          for d, fp in seen.items():
+              kept = known.setdefault(d, {})
+              # Which part drifted is written here, in the private ledger, and not to
+              # the public log: the part names follow the account's activity.
+              moved = sorted(k for k, h in fp.items() if k in kept and kept[k] != h)
+              if moved:
+                  kept.setdefault("used_changes", []).append({"noticed": noticed, "parts": moved})
+              for k, h in fp.items():
+                  kept.setdefault(k, h)        # the first sighting is the one kept
+              if kept.get("raw") not in (None, raw[d]):
+                  kept.setdefault("raw_changes", []).append(
+                      {"noticed": noticed, "from": kept["raw"], "to": raw[d]})
+              kept["raw"] = raw[d]             # the latest, so each change is noticed once
+          with open(ledger, "w") as f:
+              json.dump(known, f, indent=1, sort_keys=True)
+          # The log is public. It names no count of days and no day whose raw record
+          # changed, since both follow the account's activity; those stay in the
+          # ledger. A revised day is named: it is an incident.
+          print(f"closed days fingerprinted; changed since first seen: {drift or 'none'}")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ARCHIVE_DRIFT={','.join(drift)}\n")
+
+          # Responses are kept as received, so that the hash of this file is a
+          # hash of what the exchange actually sent.
+          with open("/tmp/archive.json", "rb") as f:
+              copy = f.read()
+          stamp = dt.datetime.utcfromtimestamp(doc["fetched_at_ms"] / 1000).strftime("%Y-%m-%d")
+          with open(f"archive/{stamp}.sha256", "w") as f:
+              f.write(f"{hashlib.sha256(copy).hexdigest()}  {stamp}.json\n")
+          print(f"copy: archive/{stamp}.json.enc")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write(f"ARCHIVE_STAMP={stamp}\n")
+          EOF
+
+      - name: Encrypt the copy
+        env:
+          PASS: ${{ secrets.TRACK_RAW_PASSPHRASE }}
+        run: |
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:PASS \
+            -in /tmp/archive.json -out "private/archive/${ARCHIVE_STAMP}.json.enc"
+          shred -u /tmp/archive.json
+
+      - name: Commit to the private repository
+        working-directory: private
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add archive
+          if git diff --cached --quiet; then
+            echo "nothing new"
+            exit 0
+          fi
+          # Quietly: the commit's summary of changed lines would show how many days the
+          # ledger gained.
+          git commit --quiet -m "archive: exchange records as of ${ARCHIVE_STAMP}" -m "$TRAILER"
+          # The daily record commits to the same repository; if it got there first,
+          # take its commit and push again.
+          git push --quiet || { git pull --quiet --rebase && git push --quiet; }
+
+      - name: Refuse to pass if the exchange revised a closed day
+        # The copy is committed first: a revision is a reason to look, never a
+        # reason to lose the day's records.
+        run: |
+          if [ -n "${ARCHIVE_DRIFT}" ]; then
+            echo "the exchange's record changed for: ${ARCHIVE_DRIFT}"
+            exit 1
+          fi
+          echo "no closed day changed"
+
+      # A failed run is told to the operator at once, so that a missed day is not found
+      # days later. The notice names the workflow and links its log; nothing more.
+      - name: Tell the operator the run failed
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC is not set"; exit 0; fi
+          curl -fsS -m 20 -H "Title: $WORKFLOW failed" -H "Priority: high" -H "Tags: warning" \
+            -d "$RUN_URL" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null

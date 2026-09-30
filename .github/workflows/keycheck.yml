@@ -1,0 +1,157 @@
+name: Key check
+
+# Run by hand. Confirms that the exchange key held in this repository's secrets
+# can read the designated account and cannot trade, withdraw or transfer, and
+# that the exchange answers requests made from GitHub's runners.
+# Also confirms that the record's sources can be read: the
+# exchange's daily account snapshots and the income ledger.
+# Prints permissions, HTTP statuses, the calendar dates the snapshots cover,
+# and hash prefixes of the latest records: no balance, position or other
+# account data, and no count that would show how active the account is.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check the key and the exchange's reachability
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          # The exchange refuses GitHub's runners, which are in the United
+          # States. Its API is reached through a proxy that relays TLS tunnels
+          # and cannot read or alter them.
+          HTTPS_PROXY: ${{ secrets.TRACK_PROXY_URL }}
+          NO_PROXY: ipinfo.io,data-api.binance.vision
+        run: |
+          python3 - <<'EOF'
+          import hashlib, hmac, json, os, sys, time
+          import urllib.error, urllib.parse, urllib.request
+
+          KEY = os.environ["BINANCE_API_KEY"]
+          SECRET = os.environ["BINANCE_API_SECRET"].encode()
+
+          def call(url, signed=False, params=None):
+              q = dict(params or {})
+              headers = {"User-Agent": "reout-track-keycheck"}
+              if signed:
+                  q["timestamp"] = int(time.time() * 1000)
+                  q["recvWindow"] = 10000
+                  qs = urllib.parse.urlencode(q)
+                  qs += "&signature=" + hmac.new(SECRET, qs.encode(), hashlib.sha256).hexdigest()
+                  headers["X-MBX-APIKEY"] = KEY
+              else:
+                  qs = urllib.parse.urlencode(q)
+              req = urllib.request.Request(url + ("?" + qs if qs else ""), headers=headers)
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      return r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+              except Exception as e:
+                  return None, str(e).encode()
+
+          def error_text(body):
+              # Error bodies carry a code and a message, never account data.
+              try:
+                  d = json.loads(body)
+                  return f"code {d.get('code')}: {d.get('msg')}"
+              except Exception:
+                  return body[:200].decode(errors="replace")
+
+          failed = False
+
+          status, body = call("https://ipinfo.io/country")
+          print(f"runner country: {body.decode().strip() if status == 200 else 'unknown'}")
+
+          for name, url, params in [
+              ("spot API", "https://api.binance.com/api/v3/time", None),
+              ("futures API", "https://fapi.binance.com/fapi/v1/time", None),
+              ("benchmark, api.binance.com", "https://api.binance.com/api/v3/klines",
+               {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}),
+              ("benchmark, data-api.binance.vision", "https://data-api.binance.vision/api/v3/klines",
+               {"symbol": "BTCUSDT", "interval": "1d", "limit": 1}),
+          ]:
+              status, body = call(url, params=params)
+              print(f"{name}: HTTP {status}" + ("" if status == 200 else f" ({error_text(body)})"))
+
+          status, body = call("https://api.binance.com/sapi/v1/account/apiRestrictions", signed=True)
+          if status == 200:
+              r = json.loads(body)
+              must_be_false = ["enableSpotAndMarginTrading", "enableMargin", "enableFutures",
+                               "enableVanillaOptions", "enablePortfolioMarginTrading",
+                               "enableWithdrawals", "enableInternalTransfer", "permitsUniversalTransfer"]
+              print(f"key permissions: enableReading={r.get('enableReading')}")
+              for k in must_be_false:
+                  print(f"key permissions: {k}={r.get(k)}")
+              if r.get("enableReading") is not True or any(r.get(k) for k in must_be_false):
+                  print("FAIL: the key must be read-only")
+                  failed = True
+          else:
+              print(f"key permissions: HTTP {status} ({error_text(body)})")
+              failed = True
+
+          status, body = call("https://fapi.binance.com/fapi/v2/balance", signed=True)
+          print(f"futures account read: HTTP {status}" + ("" if status == 200 else f" ({error_text(body)})"))
+          failed = failed or status != 200
+
+          # The record's sources. The exchange keeps daily snapshots for 30 days.
+          import calendar, datetime as dt
+          start_ms = calendar.timegm((2026, 9, 28, 0, 0, 0)) * 1000
+          status, body = call("https://api.binance.com/sapi/v1/accountSnapshot", signed=True,
+                              params={"type": "FUTURES", "startTime": start_ms,
+                                      "endTime": int(time.time() * 1000), "limit": 30})
+          if status == 200:
+              vos = json.loads(body).get("snapshotVos") or []
+              stamps = sorted(dt.datetime.utcfromtimestamp(v["updateTime"] / 1000) for v in vos)
+              days = [s.strftime("%Y-%m-%d") for s in stamps]
+              assets = [a for v in vos for a in (v.get("data") or {}).get("assets", [])]
+              fields = bool(assets) and all("walletBalance" in a and "marginBalance" in a for a in assets)
+              span = f"{days[0]} to {days[-1]}" if days else "none"
+              print(f"daily snapshots: HTTP 200, days covered {span}, balance fields present={fields}")
+              # Which instant of the day each snapshot marks, and how many assets it carries.
+              # Timestamps and counts only: no balance is printed.
+              print("snapshot stamps: " + ", ".join(s.strftime("%m-%dT%H:%M:%SZ") for s in stamps[-4:]))
+              print(f"snapshot assets per day: {sorted({len((v.get('data') or {}).get('assets', [])) for v in vos})}")
+
+              # For how long does a published record keep changing? Hash prefixes of
+              # the two latest records, whole and as the figures use them (balances
+              # and positions that hold a quantity). Compared across hourly runs.
+              def prefix(obj):
+                  return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()[:12]
+
+              def used(v):
+                  data = v.get("data") or {}
+                  return {
+                      "assets": sorted([a.get("asset", ""), a.get("walletBalance", ""),
+                                        a.get("marginBalance", "")] for a in data.get("assets") or []),
+                      "positions": sorted([p.get("symbol", ""), p.get("positionAmt", ""),
+                                           p.get("entryPrice", ""), p.get("markPrice", ""),
+                                           p.get("unRealizedProfit", "")]
+                                          for p in data.get("position") or []
+                                          if float(p.get("positionAmt") or 0) != 0),
+                  }
+
+              for v in sorted(vos, key=lambda v: v["updateTime"])[-2:]:
+                  day = dt.datetime.utcfromtimestamp(v["updateTime"] / 1000).strftime("%Y-%m-%d")
+                  print(f"record fingerprint {day}: whole {prefix(v)} · used {prefix(used(v))}")
+          else:
+              print(f"daily snapshots: HTTP {status} ({error_text(body)})")
+              failed = True
+
+          status, body = call("https://fapi.binance.com/fapi/v1/income", signed=True,
+                              params={"startTime": start_ms, "limit": 1})
+          if status == 200:
+              print(f"income ledger since 2026-09-28: HTTP 200, entries present={len(json.loads(body)) > 0}")
+          else:
+              print(f"income ledger since 2026-09-28: HTTP {status} ({error_text(body)})")
+              failed = True
+
+          sys.exit(1 if failed else 0)
+          EOF

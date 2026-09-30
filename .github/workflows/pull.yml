@@ -1,0 +1,183 @@
+name: Daily record
+
+# Produces the day's record from the exchange's own records of the account.
+#
+# Until the record begins this is a rehearsal. It does everything a record day
+# does, against the live account, but publishes into a private repository
+# instead of this one: nothing it produces is committed here.
+#
+# Each run first keeps its copy of the exchange's responses, encrypted, in the
+# private repository, so that a run that stops still leaves what it received.
+# The record is then computed from every copy kept so far (pull.py, combine),
+# because the exchange hands out an account's daily records for 30 days only.
+#
+# The log prints dates, file names and hashes only: no balance, no fill, no
+# figure of the record, and no count or size that would show how active the
+# account is.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # As measured over a week: the exchange's record of a day
+    # appears about 01:20 UTC the next day and is revised until as late as
+    # 11:19 UTC, though never in the fields the record is computed from. The run
+    # comes after the revisions, so that the copy it keeps is the exchange's
+    # final one, and clear of the proxy's restart window around 12:00 UTC.
+    - cron: "30 13 * * *"
+
+# The record is committed to this repository once it has begun (see "Rehearsal or record").
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-record
+  cancel-in-progress: false
+
+env:
+  # Every commit says which run made it and the code the run ran, so that each
+  # commit of the record leads to its run's public log.
+  TRAILER: "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}/attempts/${{ github.run_attempt }}\nCode: ${{ github.sha }}"
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check out the private repository
+        uses: actions/checkout@v4
+        with:
+          repository: reouthq/record-raw
+          ssh-key: ${{ secrets.TRACK_RAW_DEPLOY_KEY }}
+          path: private
+          # The whole history: a pending proof is judged by when it was committed.
+          fetch-depth: 0
+
+      # Before the record begins, every run rehearses: it produces the record from the
+      # account's first day into the private repository. The repository variable
+      # RECORD_INCEPTION, set at pre-registration to the day the manifest fixes, turns
+      # the run into the record from the day after that day, when the exchange's record
+      # of it exists: the record is then produced from that day and committed here.
+      - name: Rehearsal or record
+        env:
+          INCEPTION: ${{ vars.RECORD_INCEPTION }}
+        run: |
+          if [ -n "$INCEPTION" ] && [ "$(date -u +%F)" \> "$INCEPTION" ]; then
+            echo "the record, from record inception $INCEPTION"
+            { echo "MODE=record"; echo "RECORD_FROM=$INCEPTION"; echo "RECORD_OUT=."; } >> "$GITHUB_ENV"
+          else
+            echo "a rehearsal, into the private repository${INCEPTION:+ (the record begins after $INCEPTION)}"
+            { echo "MODE=rehearsal"; echo "RECORD_FROM=2026-09-28"; echo "RECORD_OUT=private/shakedown"; } >> "$GITHUB_ENV"
+          fi
+
+      - name: Install the OpenTimestamps client
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ots"
+          "$RUNNER_TEMP/ots/bin/pip" install --quiet \
+            opentimestamps-client==0.7.2 opentimestamps==0.4.5 python-bitcoinlib==0.12.2
+          "$RUNNER_TEMP/ots/bin/pip" show opentimestamps-client | grep '^Version'
+
+      - name: Fetch the exchange's records
+        env:
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+          BINANCE_API_SECRET: ${{ secrets.BINANCE_API_SECRET }}
+          # The exchange refuses GitHub's runners, which are in the United
+          # States. Its API is reached through a proxy that relays TLS tunnels
+          # and cannot read or alter them.
+          HTTPS_PROXY: ${{ secrets.TRACK_PROXY_URL }}
+        run: python3 fetch.py --out "$RUNNER_TEMP/copy.json"
+
+      - name: Keep the copy
+        env:
+          PASS: ${{ secrets.TRACK_RAW_PASSPHRASE }}
+        run: |
+          name=$(python3 -c 'import datetime as dt, json, sys
+          ms = json.load(open(sys.argv[1]))["fetched_at_ms"]
+          print(dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ"))' \
+            "$RUNNER_TEMP/copy.json")
+          mkdir -p private/account
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -pass env:PASS \
+            -in "$RUNNER_TEMP/copy.json" -out "private/account/$name.json.enc"
+          shred -u "$RUNNER_TEMP/copy.json"
+          echo "kept: account/$name.json.enc"
+          cd private
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "account/$name.json.enc"
+          git commit --quiet -m "account: the exchange's records as fetched at $name" -m "$TRAILER"
+          git push --quiet
+
+      - name: Produce the record
+        env:
+          PASS: ${{ secrets.TRACK_RAW_PASSPHRASE }}
+          # The record refuses any account but the registered one (pull.py, check_account).
+          TRACK_ACCOUNT_SALT: ${{ secrets.TRACK_ACCOUNT_SALT }}
+          HTTPS_PROXY: ${{ secrets.TRACK_PROXY_URL }}
+          # The proxy admits the exchange's API only. The benchmark's source and
+          # the OpenTimestamps calendars are reached directly.
+          NO_PROXY: data-api.binance.vision,.opentimestamps.org,.eternitywall.com,.catallaxy.com
+        run: |
+          umask 077
+          printf '%s' "$PASS" > "$RUNNER_TEMP/passphrase"
+          set +e
+          # The rehearsal's first day is the account's first; the record's, record inception.
+          python3 pull.py --record-inception "$RECORD_FROM" \
+            --archive private/archive/*.json.enc private/account/*.json.enc \
+            --passphrase-file "$RUNNER_TEMP/passphrase" \
+            --out "$RECORD_OUT" --ots "$RUNNER_TEMP/ots/bin/ots"
+          status=$?
+          shred -u "$RUNNER_TEMP/passphrase"
+          echo "RECORD_STATUS=$status" >> "$GITHUB_ENV"
+
+      - name: Commit the record
+        # Exit status 2: the record was produced, but a proof has been pending
+        # for too long. The record is committed first; the delay is reported below.
+        if: env.RECORD_STATUS == '0' || env.RECORD_STATUS == '2'
+        run: |
+          if [ "$MODE" = record ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add data attest raw
+            message="record: the record as of $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          else
+            cd private
+            git add shakedown
+            message="shakedown: the record as of $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          fi
+          if git diff --cached --quiet; then
+            echo "nothing new"
+            exit 0
+          fi
+          git commit --quiet -m "$message" -m "$TRAILER"
+          git push --quiet
+
+      # The Risk Limits promise a review within two business days of a level being reached
+      # (section 4), so reaching one sends a notice rather than waiting to be noticed.
+      # The log names levels only; NTFY_TOPIC may be unset, and then it only says so.
+      - name: Tell the operator if a level of the Risk Limits is reached
+        if: env.RECORD_STATUS == '0' || env.RECORD_STATUS == '2'
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: python3 tools/limit_alert.py --root "$RECORD_OUT"
+
+      - name: Refuse to pass unless the record was produced and its proofs are on time
+        run: |
+          case "$RECORD_STATUS" in
+            0) echo "the record was produced" ;;
+            2) echo "the record was committed, but a proof has been pending for too long"; exit 1 ;;
+            *) echo "the record was not produced (exit status $RECORD_STATUS)"; exit 1 ;;
+          esac
+
+      # A failed run is told to the operator at once, so that a missed day is not found
+      # days later. The notice names the workflow and links its log; nothing more.
+      - name: Tell the operator the run failed
+        if: failure()
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          WORKFLOW: ${{ github.workflow }}
+        run: |
+          if [ -z "$NTFY_TOPIC" ]; then echo "NTFY_TOPIC is not set"; exit 0; fi
+          curl -fsS -m 20 -H "Title: $WORKFLOW failed" -H "Priority: high" -H "Tags: warning" \
+            -d "$RUN_URL" "https://ntfy.sh/$NTFY_TOPIC" > /dev/null
