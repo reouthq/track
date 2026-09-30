@@ -6,4 +6,4 @@ applies to any report. Prior reports are not recalculated under a later methodol
 
 | Date (UTC) | File | Change | Anchor |
 |---|---|---|---|
-| (at pre-registration) | all | Initial versions, pre-registered before record inception | (manifest written at pre-registration) |
+| 2026-09-30 | all | Initial versions, pre-registered before record inception | `attest/2026-09-30-preregistration.md` |

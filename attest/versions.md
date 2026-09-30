@@ -17,4 +17,4 @@ and the Monthly Report says so. Logic changes are made when ready, under the sam
 
 | # | Version | Deployed (UTC) | Class | Sealed configuration hash | Anchor |
 |---|---|---|---|---|---|
-| 1 | 1.0 | 2026-09-28 | initial | set at pre-registration | `attest/<date>-preregistration.md.ots` |
+| 1 | 1.0 | 2026-09-28 | initial | `7f5bf50d89803afc06b9c52e50e9b3c35628ada684935dd1f375134c8943bf35` | `attest/2026-09-30-preregistration.md.ots` |
