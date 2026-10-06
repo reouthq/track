@@ -137,11 +137,24 @@ jobs:
 
           closed = sorted(d for d in set(records_by_day) | set(income_by_day) | set(fills_by_day)
                           if d < settled)
-          seen = {d: {"valuation": digest(used(records_by_day.get(d))),
-                      "income": digest(ordered(income_by_day, d)),
-                      "fills": digest(ordered(fills_by_day, d))}
-                  for d in closed}
-          raw = {d: digest(records_by_day.get(d)) for d in closed}
+          # A part is fingerprinted only where the copy holds the whole day of it.
+          # The daily records are asked for over the last 29 days and the income
+          # ledger and the fills over the last 80 (fetch.py), so a day ageing out
+          # leaves the copy, and the first day of the ledger's span is cut at the
+          # hour it starts: absent or cut, a part is not compared.
+          LEDGER_DAYS = 80                    # fetch.py, MAX_LOOKBACK_MS
+          ledger_from = (dt.datetime.now(dt.timezone.utc)
+                         - dt.timedelta(days=LEDGER_DAYS)).strftime("%Y-%m-%d")
+          seen = {}
+          for d in closed:
+              parts = {}
+              if d in records_by_day:
+                  parts["valuation"] = digest(used(records_by_day[d]))
+              if d > ledger_from:
+                  parts["income"] = digest(ordered(income_by_day, d))
+                  parts["fills"] = digest(ordered(fills_by_day, d))
+              seen[d] = parts
+          raw = {d: digest(records_by_day[d]) for d in closed if d in records_by_day}
 
           os.makedirs("archive", exist_ok=True)
           ledger = "archive/days.json"
@@ -164,10 +177,11 @@ jobs:
                   kept.setdefault("used_changes", []).append({"noticed": noticed, "parts": moved})
               for k, h in fp.items():
                   kept.setdefault(k, h)        # the first sighting is the one kept
-              if kept.get("raw") not in (None, raw[d]):
-                  kept.setdefault("raw_changes", []).append(
-                      {"noticed": noticed, "from": kept["raw"], "to": raw[d]})
-              kept["raw"] = raw[d]             # the latest, so each change is noticed once
+              if d in raw:
+                  if kept.get("raw") not in (None, raw[d]):
+                      kept.setdefault("raw_changes", []).append(
+                          {"noticed": noticed, "from": kept["raw"], "to": raw[d]})
+                  kept["raw"] = raw[d]         # the latest, so each change is noticed once
           with open(ledger, "w") as f:
               json.dump(known, f, indent=1, sort_keys=True)
           # The log is public. It names no count of days and no day whose raw record

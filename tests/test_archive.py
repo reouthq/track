@@ -125,6 +125,38 @@ class FingerprintLedger(unittest.TestCase):
         self.assertEqual(drift, [])
         self.assertEqual(sorted(known), [DAY, "2026-03-09"])
 
+    def test_a_day_past_the_daily_records_span_is_not_drift(self):
+        # The daily records are asked for over the last 29 days (fetch.py). A day that
+        # has aged out of that span is absent from the copy, not revised.
+        args = ([snapshot(DAY, "100", [position("-0.1")])], [ledger_page(DAY, "-1")],
+                [fill_page(DAY, "50000")])
+        _, first = self.run_block(*args)
+        drift, known = self.run_block([], args[1], args[2], today="2026-04-08")
+        self.assertEqual(drift, [])
+        self.assertEqual(known[DAY]["valuation"], first[DAY]["valuation"])
+        self.assertEqual(known[DAY]["raw"], first[DAY]["raw"])
+        self.assertNotIn("used_changes", known[DAY])
+
+    def test_a_day_past_the_ledger_span_is_not_drift(self):
+        # The income ledger and the fills are asked for over the last 80 days (fetch.py).
+        args = ([snapshot(DAY, "100")], [ledger_page(DAY, "-1")], [fill_page(DAY, "50000")])
+        _, first = self.run_block(*args)
+        drift, known = self.run_block([], [], [], today="2026-05-28")
+        self.assertEqual(drift, [])
+        self.assertEqual(known[DAY], first[DAY])
+
+    def test_the_cut_first_day_of_the_ledger_span_is_not_drift(self):
+        # On the 80th day the ledger's span starts inside the day, so part of it is gone.
+        both = "[" + ledger_page(DAY, "-1")[1:-1] + ", " + ledger_page(DAY, "-2", tran=2)[1:-1] + "]"
+        self.run_block([snapshot(DAY, "100")], [both])
+        drift, _ = self.run_block([], [ledger_page(DAY, "-2", tran=2)], today="2026-05-27")
+        self.assertEqual(drift, [])
+
+    def test_a_ledger_entry_lost_inside_the_span_is_caught(self):
+        self.run_block([snapshot(DAY, "100")], [ledger_page(DAY, "-1")])
+        drift, _ = self.run_block([snapshot(DAY, "100")], [], today="2026-03-20")
+        self.assertEqual(drift, [DAY])
+
     def test_a_day_the_exchange_may_still_complete_is_not_fingerprinted(self):
         # It completes a record after handing it out, so a day is
         # fingerprinted only once it has been settled for SETTLE_DAYS.
