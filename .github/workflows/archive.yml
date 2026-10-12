@@ -151,7 +151,13 @@ jobs:
               if d in records_by_day:
                   parts["valuation"] = digest(used(records_by_day[d]))
               if d > ledger_from:
-                  parts["income"] = digest(ordered(income_by_day, d))
+                  # Without the entries' times: the exchange has restamped its whole ledger
+                  # by tens of milliseconds, amounts and ids unchanged, and the figures take
+                  # an entry's day, not its millisecond (pull.py, combine). An entry moved to
+                  # another day still changes both days.
+                  parts["ledger"] = digest(sorted(
+                      json.dumps({k: v for k, v in e.items() if k != "time"}, sort_keys=True)
+                      for e in ordered(income_by_day, d)))
                   parts["fills"] = digest(ordered(fills_by_day, d))
               seen[d] = parts
           raw = {d: digest(records_by_day[d]) for d in closed if d in records_by_day}

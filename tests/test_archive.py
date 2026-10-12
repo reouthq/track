@@ -102,7 +102,7 @@ class FingerprintLedger(unittest.TestCase):
                                       [fill_page(DAY, "50000")])
         self.assertEqual(drift, [])
         self.assertEqual(sorted(known), [DAY])
-        self.assertEqual(sorted(known[DAY]), ["fills", "income", "raw", "valuation"])
+        self.assertEqual(sorted(known[DAY]), ["fills", "ledger", "raw", "valuation"])
 
     def test_the_same_fetch_again_reports_no_change(self):
         args = ([snapshot(DAY, "100", [position("-0.1")])], [ledger_page(DAY, "-1")],
@@ -150,6 +150,29 @@ class FingerprintLedger(unittest.TestCase):
         both = "[" + ledger_page(DAY, "-1")[1:-1] + ", " + ledger_page(DAY, "-2", tran=2)[1:-1] + "]"
         self.run_block([snapshot(DAY, "100")], [both])
         drift, _ = self.run_block([], [ledger_page(DAY, "-2", tran=2)], today="2026-05-27")
+        self.assertEqual(drift, [])
+
+    def test_a_ledger_fingerprinted_with_times_before_this_rule_is_not_drift(self):
+        # The ledger part was once fingerprinted with its entries' times, as "income".
+        self.run_block([snapshot(DAY, "100")], [ledger_page(DAY, "-1")])
+        self.rewrite(lambda known: known[DAY].update(income="0" * 64))
+        page = json.loads(ledger_page(DAY, "-1"))
+        page[0]["time"] += 48
+        drift, known = self.run_block([snapshot(DAY, "100")], [json.dumps(page)], today="2026-03-13")
+        self.assertEqual(drift, [])
+
+    def test_a_ledger_amount_changed_with_its_time_is_caught(self):
+        self.run_block([snapshot(DAY, "100")], [ledger_page(DAY, "-1")])
+        page = json.loads(ledger_page(DAY, "-2"))
+        page[0]["time"] += 48
+        drift, _ = self.run_block([snapshot(DAY, "100")], [json.dumps(page)], today="2026-03-13")
+        self.assertEqual(drift, [DAY])
+
+    def test_ledger_times_moved_by_milliseconds_are_not_drift(self):
+        self.run_block([snapshot(DAY, "100")], [ledger_page(DAY, "-1")])
+        page = json.loads(ledger_page(DAY, "-1"))
+        page[0]["time"] += 48
+        drift, _ = self.run_block([snapshot(DAY, "100")], [json.dumps(page)], today="2026-03-13")
         self.assertEqual(drift, [])
 
     def test_a_ledger_entry_lost_inside_the_span_is_caught(self):
@@ -253,7 +276,7 @@ class FingerprintLedger(unittest.TestCase):
         self.assertEqual(drift, [])
         self.assertNotIn("records", known[DAY])
         self.assertEqual(sorted(k for k in known[DAY] if k != "raw_changes"),
-                         ["fills", "income", "raw", "valuation"])
+                         ["fills", "ledger", "raw", "valuation"])
         self.assertEqual(len(known[DAY]["raw_changes"]), 1)
 
 

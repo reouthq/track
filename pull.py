@@ -276,6 +276,20 @@ def valuation(v):
                    for p in data.get("position") or [] if Decimal(p.get("positionAmt") or "0"))]
 
 
+# The exchange has restamped its whole income ledger by tens of milliseconds, amounts
+# and ids unchanged (as seen). A ledger entry may move by less than this between copies.
+LEDGER_TIME_SLACK_MS = 1000
+
+
+def agree(kept, held, slack):
+    """Whether two copies hold the same items of a day: the same items, and, where a
+    slack is given, times that differ by less than it."""
+    if slack is None:
+        return kept == held
+    return kept.keys() == held.keys() and all(
+        abs(int(kept[k]["time"]) - int(held[k]["time"])) < slack for k in kept)
+
+
 def combine(copies):
     """One document from every retained copy of the exchange's records.
 
@@ -293,9 +307,12 @@ def combine(copies):
     earlier is an incident (section 5).
 
     The income ledger and the fills are another matter. An entry or a fill that
-    changed after the day ended has never been seen, and would mean the account's
-    history itself had been rewritten, so it stops the run, as does a recorded day
-    that no copy holds whole after it ended.
+    changed after the day ended would mean the account's history itself had been
+    rewritten, so it stops the run, as does a recorded day that no copy holds whole
+    after it ended. The one change allowed is the exchange restamping a ledger
+    entry by less than LEDGER_TIME_SLACK_MS, as it has done to every entry at once,
+    amounts and ids unchanged; the newest copy's time is then taken. A restamp that
+    moved a published figure would still stop the run: published rows are final.
     """
     records, ledger, fills, revised = {}, {}, {}, []
     for copy in sorted(copies, key=lambda c: c["fetched_at_ms"]):
@@ -311,10 +328,11 @@ def combine(copies):
 
         start = copy["window"]["start_ms"]
         first = ms_to_day(start + (-start) % 86_400_000)       # the first day it holds whole
-        for what, kept, bodies, key in (
+        for what, kept, bodies, key, slack in (
                 ("income ledger", ledger, copy["income_responses"],
-                 lambda e: json.dumps(e, sort_keys=True)),
-                ("fills", fills, copy["trade_responses"], lambda t: str(t["id"]))):
+                 lambda e: json.dumps({k: v for k, v in e.items() if k != "time"}, sort_keys=True),
+                 LEDGER_TIME_SLACK_MS),
+                ("fills", fills, copy["trade_responses"], lambda t: str(t["id"]), None)):
             held = {}
             for body in bodies:
                 for item in json.loads(body):
@@ -323,7 +341,7 @@ def combine(copies):
             while day <= fetched:
                 closed = day < fetched
                 items = held.get(day, {})
-                if closed and day in kept and kept[day][1] and kept[day][2] != items:
+                if closed and day in kept and kept[day][1] and not agree(kept[day][2], items, slack):
                     raise SystemExit(f"the exchange's {what} of {day} differs between the copies "
                                      f"fetched on {kept[day][0]} and {fetched}; the record is not produced")
                 kept[day] = (fetched, closed, items)

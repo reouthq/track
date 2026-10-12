@@ -164,6 +164,13 @@ class Agreement(unittest.TestCase):
         self.assertEqual(pull.daily_records(history),
                          pull.daily_records(pull.combine([copy_on(5), copy_on(6)])))
 
+    def test_ledger_times_the_exchange_moved_by_milliseconds_do_not_stop_the_run(self):
+        # The exchange has restamped every entry of its ledger tens of milliseconds
+        # later, amounts and ids unchanged. The newest copy's times are taken.
+        later = with_items(copy_on(6), "income_responses", lambda e: dict(e, time=e["time"] + 48))
+        history = pull.combine([copy_on(5), later])
+        self.assertIn(START + 3 * DAY + 12 * HOUR + 48, [e["ts"] for e in pull.income_entries(history)])
+
 
 class Disagreement(unittest.TestCase):
 
@@ -214,6 +221,12 @@ class Disagreement(unittest.TestCase):
                              lambda e: dict(e, income="-1.10000000")
                              if e["time"] == START + 3 * DAY + 12 * HOUR else e)
         self.assertStops([copy_on(5), changed], f"income ledger of {day(3)}")
+
+    def test_a_ledger_entry_moved_by_more_than_a_second_stops_the_run(self):
+        moved = with_items(copy_on(6), "income_responses",
+                           lambda e: dict(e, time=e["time"] + 2000)
+                           if e["time"] == START + 3 * DAY + 12 * HOUR else e)
+        self.assertStops([copy_on(5), moved], f"income ledger of {day(3)}")
 
     def test_a_fill_that_differs_between_copies_stops_the_run(self):
         changed = with_items(copy_on(6), "trade_responses",
