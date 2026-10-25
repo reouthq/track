@@ -70,6 +70,23 @@ BASE_CURRENCY = "USDT"
 # one second before midnight; this allows for it moving by a few minutes.
 VALUATION_POINT_SLACK_MS = 5 * 60_000
 
+# Section 3: from the valuation interval ending on this day, an external cash flow is
+# valued at its time and splits the interval; before it, a flow was treated as occurring
+# at the start of the interval. The day is that of the amendment in CHANGELOG.md, whose
+# first interval, published before it, is corrected (CORRECTIONS).
+FLOW_VALUATION_FROM = "2026-10-22"
+
+# Section 5: a published row is final, and a figure in it changes only by a correction,
+# declared here as (file, first day, columns, reason). This script writes the
+# correction's rows of data/corrections.csv, each with the published and the corrected
+# value; the published file keeps the published value. Any other change of a published
+# figure stops the run. A reason must not contain a comma.
+CORRECTIONS = [
+    ("data/equity_daily.csv", "2026-10-22", ("ret_twr", "nav_idx", "ret_l1", "nav_l1_idx"),
+     "2026-10-22 recomputed with its two withdrawals valued at their times (Methodology section 3 "
+     "as amended 2026-10-25) instead of at the start of the day; the index values after it follow"),
+]
+
 # Entry prices rebuilt from fills are computed exactly; this only allows for the
 # exchange stating an average to fewer digits than the division gives.
 ENTRY_TOLERANCE = Decimal("1e-9")
@@ -375,6 +392,27 @@ def held_sides(v):
     return out
 
 
+def apply_fill(book, t):
+    """Apply one fill to {side: [size, entry price]} the way the exchange keeps a position.
+
+    A fill that adds to a side moves its entry price to the size-weighted average, a
+    fill that reduces it leaves the entry price where it was, and a side that reaches
+    zero starts again. False for a fill of no side: the account is in hedge mode
+    (section 1), so such a fill is not one of its positions.
+    """
+    side = t["positionSide"]
+    if side not in ("LONG", "SHORT"):
+        return False
+    size, entry = book.get(side, [Decimal(0), Decimal(0)])
+    qty, price = Decimal(t["qty"]), Decimal(t["price"])
+    if (side == "LONG") == (t["side"] == "BUY"):
+        book[side] = [size + qty, (size * entry + qty * price) / (size + qty)]
+    else:
+        left = size - qty
+        book[side] = [left, entry if left > 0 else Decimal(0)]
+    return True
+
+
 def check_entries(doc):
     """Days whose positions do not follow from the previous record and the fills between.
 
@@ -400,17 +438,9 @@ def check_entries(doc):
         for t in fills:
             if not start < int(t["time"]) <= end:
                 continue
-            side = t["positionSide"]
-            if side not in ("LONG", "SHORT"):          # the account is in hedge mode (section 1)
+            if not apply_fill(book, t):
                 bad = True
                 break
-            size, entry = book.get(side, [Decimal(0), Decimal(0)])
-            qty, price = Decimal(t["qty"]), Decimal(t["price"])
-            if (side == "LONG") == (t["side"] == "BUY"):
-                book[side] = [size + qty, (size * entry + qty * price) / (size + qty)]
-            else:
-                left = size - qty
-                book[side] = [left, entry if left > 0 else Decimal(0)]
         expected = {s: (q, e) for s, (q, e) in book.items() if q}
         actual = held_sides(cur)
         if not bad:
@@ -461,6 +491,72 @@ def check_marks(records, candles):
         if k is None or not float(k[3]) <= r["mark"] <= float(k[2]):
             wrong.append(r["date"])
     return wrong
+
+
+def flow_minutes(records, income, since):
+    """Start of the minute of each external cash flow that is valued at its time.
+
+    Those are the flows of every interval ending on or after `since` (section 3).
+    """
+    out = set()
+    for prev, cur in zip(records, records[1:]):
+        if cur["date"] >= since:
+            out |= {mark_minute(e["ts"]) for e in income
+                    if e["type"] in FLOW_TYPES and prev["ts"] < e["ts"] <= cur["ts"]}
+    return sorted(out)
+
+
+def flow_mark_candles(minutes):
+    """The public mark-price candle of each minute that holds a valued flow (section 2).
+
+    Public data, no key; one request for each such minute.
+    """
+    out = {}
+    for start in minutes:
+        q = urllib.parse.urlencode({"symbol": INSTRUMENT, "interval": "1m",
+                                    "startTime": start, "limit": 1})
+        with urllib.request.urlopen(f"{MARK_PRICE_URL}?{q}", timeout=30) as resp:
+            rows = json.loads(resp.read())
+        if rows and int(rows[0][0]) == start:
+            out[start] = rows[0]
+    return out
+
+
+def values_at_flows(doc, records, income, candles, since):
+    """NAV immediately before each external cash flow that is valued at its time (section 2).
+
+    {flow timestamp: nav}. The wallet is the previous record's wallet moved by every
+    ledger entry before the flow; the positions are the previous record's, moved by
+    every fill before the flow (`apply_fill`); they are marked at the opening price
+    of the public mark-price candle of the minute that holds the flow. Flows that
+    share a timestamp are one flow.
+    """
+    vos = {int(v["updateTime"]): v for v in json.loads(doc["daily_records_response"])["snapshotVos"]}
+    fills = fills_of(doc)
+    out = {}
+    for prev, cur in zip(records, records[1:]):
+        if cur["date"] < since:
+            continue
+        for ts in sorted({e["ts"] for e in income
+                          if e["type"] in FLOW_TYPES and prev["ts"] < e["ts"] <= cur["ts"]}):
+            wallet = prev["wallet"] + sum(e["amount"] for e in income if prev["ts"] < e["ts"] < ts)
+            book = {side: list(pos) for side, pos in held_sides(vos[prev["ts"]]).items()}
+            for t in fills:
+                if prev["ts"] < int(t["time"]) < ts and not apply_fill(book, t):
+                    raise SystemExit(f"a fill before the flow at {ms_to_iso(ts)} belongs to no "
+                                     f"side of the account; the record is not produced")
+            held = {side: pos for side, pos in book.items() if pos[0]}
+            unrealized = 0.0
+            if held:
+                k = candles.get(mark_minute(ts))
+                if k is None:
+                    raise SystemExit(f"no public mark price for the minute of the flow at "
+                                     f"{ms_to_iso(ts)}; the record is not produced")
+                price = float(k[1])
+                unrealized = sum((1 if side == "LONG" else -1) * float(size) * (price - float(entry))
+                                 for side, (size, entry) in held.items())
+            out[ts] = wallet + unrealized
+    return out
 
 
 def benchmark_responses(days):
@@ -531,12 +627,17 @@ def day_to_ms(day):
 
 # --- the record ------------------------------------------------------------
 
-def build(records, income, closes, versions, inception, leverage):
+def build(records, income, closes, versions, inception, leverage,
+          flow_values=None, valued_from=FLOW_VALUATION_FROM):
     """The three daily series of section 5.
 
     Returns (equity rows, transfer rows, income rows). Amounts stay inside this
-    function: every value returned is a ratio or an index.
+    function: every value returned is a ratio or an index. `flow_values` holds
+    the NAV immediately before each flow of an interval ending on or after
+    `valued_from` (`values_at_flows`); a transfer row of such an interval also
+    carries `nav_before_frac`, that NAV as a share of the previous one.
     """
+    flow_values = flow_values or {}
     records = [r for r in records if r["date"] >= inception]
     if not records or records[0]["date"] != inception:
         raise SystemExit(f"no record of the account for record inception {inception}")
@@ -564,8 +665,24 @@ def build(records, income, closes, versions, inception, leverage):
                              f"pull.py; the record is not produced")
         flow = sum(e["amount"] for e in window if e["type"] in FLOW_TYPES)
 
-        # Section 4. The net transfer is treated as occurring at the start.
-        opening = prev["nav"] + flow
+        # Section 3. Before `valued_from` the net transfer is treated as occurring at
+        # the start. From it, each flow is valued at its time and ends a sub-period;
+        # the next opens at that value plus the flow, and the sub-periods are linked.
+        steps = []                                  # (value before the flow, flow) in time order
+        if cur["date"] >= valued_from:
+            for ts in sorted({e["ts"] for e in window if e["type"] in FLOW_TYPES}):
+                if ts not in flow_values:
+                    raise SystemExit(f"the flow at {ms_to_iso(ts)} has not been valued at its "
+                                     f"time; the record is not produced")
+                steps.append((flow_values[ts], sum(e["amount"] for e in window
+                                                   if e["type"] in FLOW_TYPES and e["ts"] == ts)))
+        opening, growth = (prev["nav"], 1.0) if steps else (prev["nav"] + flow, 1.0)
+        for value, amount in steps:
+            if value <= 0:
+                raise SystemExit(f"the account is worth nothing or less before a flow of the "
+                                 f"interval ending {cur['date']}; the record is not produced")
+            growth *= value / opening
+            opening = value + amount
         if opening <= 0:
             raise SystemExit(f"the interval ending {cur['date']} opens at nothing to invest "
                              f"(the account was emptied or is past its wallet); "
@@ -573,7 +690,7 @@ def build(records, income, closes, versions, inception, leverage):
         if cur["nav"] <= 0:
             raise SystemExit(f"on {cur['date']} the account is worth nothing or less; "
                              f"the record is not produced")
-        ret = cur["nav"] / opening - 1
+        ret = growth * cur["nav"] / opening - 1
         ret_l1 = ret / leverage                                    # section 3
         idx *= 1 + ret
         idx_l1 *= 1 + ret_l1
@@ -594,6 +711,8 @@ def build(records, income, closes, versions, inception, leverage):
                 transfers.append({"ts_utc": ms_to_iso(e["ts"]),
                                   "amount_frac": e["amount"] / prev["nav"],
                                   "kind": "transfer" if e["type"] in TRANSFER_TYPES else "credit"})
+                if steps:
+                    transfers[-1]["nav_before_frac"] = flow_values[e["ts"]] / prev["nav"]
 
         # Section 9: the types grouped under other_frac are named, without their
         # separate amounts. A name that is not a plain identifier could break the
@@ -726,7 +845,10 @@ def money_weighted(equity, transfers):
 
     Worked out from the published ratios alone, so that anyone can reproduce it:
     the net asset value is rebuilt up to scale from `flow_frac` and `ret_twr`, and
-    each transfer is sized by `amount_frac` against the value before it. Until the
+    each transfer is sized by `amount_frac` against the value before it. On a day
+    whose flows were valued at their time, `ret_twr` links sub-periods, so the
+    day's change of value is rebuilt from the values before its flows instead
+    (`nav_before_frac`, published in `data/flow_valuations.csv`). Until the
     record spans 365 days the rate is stated for the period ("period"), and as an
     annual rate after ("annual").
     """
@@ -734,8 +856,21 @@ def money_weighted(equity, transfers):
         return None, None
     ts = [iso_to_ms(r["mark_ts_utc"]) for r in equity]
     level = [1.0]
-    for r in equity[1:]:
-        level.append(level[-1] * (1 + r["flow_frac"]) * (1 + r["ret_twr"]))
+    for k, r in enumerate(equity[1:], start=1):
+        valued = [t for t in transfers if "nav_before_frac" in t
+                  and ts[k - 1] < iso_to_ms(t["ts_utc"]) <= ts[k]]
+        if not valued:
+            level.append(level[-1] * (1 + r["flow_frac"]) * (1 + r["ret_twr"]))
+            continue
+        # 1 + ret_twr = growth to the first flow × ... × NAV_t / (opening after the last)
+        growth, opening, last = 1.0, 1.0, None
+        for t in valued:                    # in time order; flows valued together are one flow
+            point = (t["ts_utc"], t["nav_before_frac"])
+            if point != last:
+                growth *= t["nav_before_frac"] / opening
+                opening, last = t["nav_before_frac"], point
+            opening += t["amount_frac"]
+        level.append(level[-1] * (1 + r["ret_twr"]) * opening / growth)
     flows = [(ts[0], level[0])]
     for t in transfers:
         at = iso_to_ms(t["ts_utc"])
@@ -826,6 +961,7 @@ EQUITY_COLUMNS = ["date_utc", "mark_ts_utc", "flow_frac", "ret_twr", "nav_idx",
                   "ret_l1", "nav_l1_idx", "btc_close", "ret_btc", "version"]
 INCOME_COLUMNS = ["date_utc", "realized_pnl_frac", "costs_frac", "other_frac", "other_types"]
 TRANSFER_COLUMNS = ["ts_utc", "amount_frac", "kind"]
+VALUATION_COLUMNS = ["ts_utc", "nav_before_frac"]                  # section 3
 CORRECTIONS_COLUMNS = ["date", "file", "column", "published_value", "corrected_value",
                        "reason"]                                   # section 5
 MONTHLY_COLUMNS = ["month", "through_utc",
@@ -840,7 +976,7 @@ MONTHLY_COLUMNS = ["month", "through_utc",
                    "trailing_30d", "trailing_65d"]
 PLACES = {"flow_frac": 8, "ret_twr": 8, "ret_l1": 8, "ret_btc": 8,
           "nav_idx": 6, "nav_l1_idx": 6, "btc_close": 2,
-          "amount_frac": 8, "realized_pnl_frac": 8, "costs_frac": 8, "other_frac": 8}
+          "amount_frac": 8, "nav_before_frac": 8, "realized_pnl_frac": 8, "costs_frac": 8, "other_frac": 8}
 PLACES.update({c: 8 for c in MONTHLY_COLUMNS
                if c not in ("month", "through_utc", "mwr_basis", "return_days_itd",
                             "days_underwater")})
@@ -851,6 +987,18 @@ def as_csv(rows, columns):
     for r in rows:
         out.append(",".join(fmt(c, r[c]) for c in columns))
     return "\n".join(out)
+
+
+def valuation_rows(transfers):
+    """The rows of `data/flow_valuations.csv`: NAV immediately before each flow valued at
+    its time, as a share of the previous valuation point's (section 3); one per flow."""
+    out = []
+    for t in transfers:
+        if "nav_before_frac" in t:
+            row = {"ts_utc": t["ts_utc"], "nav_before_frac": t["nav_before_frac"]}
+            if not out or out[-1] != row:
+                out.append(row)
+    return out
 
 
 def check_unchanged(path, rows, columns):
@@ -878,6 +1026,61 @@ def check_unchanged(path, rows, columns):
             raise SystemExit(f"this run would change the published row "
                              f"{line.split(',')[0]}; the record is not produced")
     return len(published) - 1
+
+
+def logged_corrections(path):
+    """The rows of data/corrections.csv, by (date, file, column)."""
+    if not os.path.exists(path):
+        return {}
+    lines = open(path).read().splitlines()
+    if not lines or lines[0] != ",".join(CORRECTIONS_COLUMNS):
+        raise SystemExit(f"the columns of {path} are not those of the log of corrections; "
+                         f"the record is not produced")
+    out = {}
+    for line in lines[1:]:
+        row = dict(zip(CORRECTIONS_COLUMNS, line.split(",", len(CORRECTIONS_COLUMNS) - 1)))
+        out[(row["date"], row["file"], row["column"])] = row
+    return out
+
+
+def check_corrected(path, rel, rows, columns, logged):
+    """A published row is final except where a declared correction covers it (section 5).
+
+    Returns (the published lines, the correction rows this run adds). A cell may
+    differ from its published value only where CORRECTIONS covers its file, day and
+    column. The first run to compute the corrected value logs it; every later run
+    must compute the same value again, and a logged correction whose cell no longer
+    differs stops the run as well.
+    """
+    if not os.path.exists(path):
+        return [], []
+    published = open(path).read().splitlines()
+    if not published:
+        return [], []
+    fresh = as_csv(rows, columns).splitlines()
+    if published[0] != fresh[0]:
+        raise SystemExit(f"the columns of {path} have changed; the record is not produced")
+    added = []
+    for i, line in enumerate(published[1:], start=1):
+        if i >= len(fresh):
+            raise SystemExit(f"this run drops the published row {line.split(',')[0]}; "
+                             f"the record is not produced")
+        day = line.split(",")[0]
+        for column, was, now in zip(columns, line.split(","), fresh[i].split(",")):
+            log = logged.get((day, rel, column))
+            if was == now and log is None:
+                continue
+            cover = [c for c in CORRECTIONS if c[0] == rel and day >= c[1] and column in c[2]]
+            if was == now or not cover:
+                raise SystemExit(f"this run would change the published row {day}; "
+                                 f"the record is not produced")
+            if log is None:
+                added.append({"date": day, "file": rel, "column": column, "published_value": was,
+                              "corrected_value": now, "reason": cover[0][3]})
+            elif (log["published_value"], log["corrected_value"]) != (was, now):
+                raise SystemExit(f"this run computes a value of {day}, {column} other than its "
+                                 f"logged correction; the record is not produced")
+    return published, added
 
 
 def check_monthly_unchanged(path, rows):
@@ -969,8 +1172,12 @@ def publish(root, equity, transfers, income_daily, monthly, benchmark, private):
     """
     tables = [("data/equity_daily.csv", equity, EQUITY_COLUMNS),
               ("data/income_daily.csv", income_daily, INCOME_COLUMNS),
-              ("data/transfers.csv", transfers, TRANSFER_COLUMNS)]
-    published = check_unchanged(os.path.join(root, tables[0][0]), equity, EQUITY_COLUMNS)
+              ("data/transfers.csv", transfers, TRANSFER_COLUMNS),
+              ("data/flow_valuations.csv", valuation_rows(transfers), VALUATION_COLUMNS)]
+    corrections = "data/corrections.csv"
+    lines, corrected = check_corrected(os.path.join(root, tables[0][0]), tables[0][0], equity,
+                                       EQUITY_COLUMNS, logged_corrections(os.path.join(root, corrections)))
+    published = max(len(lines) - 1, 0)
     for rel, rows, columns in tables[1:]:
         check_unchanged(os.path.join(root, rel), rows, columns)
     check_monthly_unchanged(os.path.join(root, "data/monthly.csv"), monthly)
@@ -1001,12 +1208,19 @@ def publish(root, equity, transfers, income_daily, monthly, benchmark, private):
             raise SystemExit(f"{day} is published without its benchmark response; "
                              f"the record is not produced")
 
-    # Nothing has been written up to here.
+    # Nothing has been written up to here. The published lines of the daily series are
+    # kept as published; a correction is a row of the log (section 5).
     for rel, rows, columns in tables:
-        write_bytes(os.path.join(root, rel), (as_csv(rows, columns) + "\n").encode())
-    corrections = "data/corrections.csv"
-    if not os.path.exists(os.path.join(root, corrections)):
-        write_bytes(os.path.join(root, corrections), (",".join(CORRECTIONS_COLUMNS) + "\n").encode())
+        out = as_csv(rows, columns).splitlines()
+        if rel == tables[0][0] and lines:
+            out = lines + out[len(lines):]
+        write_bytes(os.path.join(root, rel), ("\n".join(out) + "\n").encode())
+    log = os.path.join(root, corrections)
+    if not os.path.exists(log):
+        write_bytes(log, (",".join(CORRECTIONS_COLUMNS) + "\n").encode())
+    if corrected:
+        write_bytes(log, read_bytes(log) + (as_csv(corrected, CORRECTIONS_COLUMNS)
+                                            .split("\n", 1)[1] + "\n").encode())
     for rel, body in raws.items():
         write_bytes(os.path.join(root, rel), body)
 
@@ -1162,9 +1376,14 @@ def main():
         if close is not None:
             closes[day] = close
 
+    # Section 3: each flow of an interval ending on or after FLOW_VALUATION_FROM is
+    # valued at its time, from the ledger, the fills and the public mark price.
+    flow_values = values_at_flows(history, records, income,
+                                  flow_mark_candles(flow_minutes(records, income, FLOW_VALUATION_FROM)),
+                                  FLOW_VALUATION_FROM)
     equity, transfers, income_daily, checks = build(
         records, income, closes, program_versions(a.versions),
-        a.record_inception, a.leverage)
+        a.record_inception, a.leverage, flow_values)
     monthly = monthly_rows(equity, transfers)
 
     # The gap itself is not printed: a gap of one unit of the exchange's precision,
@@ -1198,8 +1417,11 @@ def main():
 
     published = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "data", "equity_daily.csv")
-    kept = check_unchanged(published, equity, EQUITY_COLUMNS)
-    print(f"# published rows unchanged by this run: {kept}")
+    lines, corrected = check_corrected(published, "data/equity_daily.csv", equity, EQUITY_COLUMNS,
+                                       logged_corrections(os.path.join(os.path.dirname(published),
+                                                                       "corrections.csv")))
+    print(f"# published rows kept by this run: {max(len(lines) - 1, 0)}; "
+          f"corrections it would log: {len(corrected)}")
 
     print(f"# test mode: nothing is written. {len(equity)} days from "
           f"{equity[0]['date_utc']} to {equity[-1]['date_utc']}\n")
@@ -1208,6 +1430,8 @@ def main():
     print("\n--- data/transfers.csv ---")
     print(as_csv(transfers, TRANSFER_COLUMNS) if transfers
           else "ts_utc,amount_frac\n(no external transfer in the period)")
+    print("\n--- data/flow_valuations.csv ---")
+    print(as_csv(valuation_rows(transfers), VALUATION_COLUMNS))
     print("\n--- data/income_daily.csv ---")
     print(as_csv(income_daily, INCOME_COLUMNS))
     print("\n--- data/monthly.csv ---")

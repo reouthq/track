@@ -626,5 +626,150 @@ class EntryPricesFromFills(unittest.TestCase):
             pull.check_entries(doc)
 
 
+class FlowsValuedAtTheirTime(unittest.TestCase):
+    """From FLOW_VALUATION_FROM a flow is valued at its time and splits the interval (section 3)."""
+
+    D0, D1, D2 = "2026-11-01", "2026-11-02", "2026-11-03"
+
+    def at(self, day, hour):
+        return pull.day_to_ms(day) + hour * 3_600_000
+
+    def run_(self, records, income, values, valued_from=None):
+        return pull.build(list(records), list(income), {}, VERSIONS, records[0]["date"], L,
+                          values, valued_from or self.D1)
+
+    def withdrawal_day(self, valued_from=None):
+        # 100 at the start; the day's loss of 5 is taken on the whole account before 80
+        # is taken out at 08:00; the 15 left ends the day at 15.
+        t = self.at(self.D1, 8)
+        return self.run_([rec(self.D0, 100), rec(self.D1, 15)],
+                         [{"ts": t, "type": "TRANSFER", "amount": -80.0}], {t: 95.0}, valued_from)
+
+    def test_a_withdrawal_after_a_loss_takes_the_loss_on_the_whole_account(self):
+        equity, _, _, _ = self.withdrawal_day()
+        self.assertAlmostEqual(equity[1]["ret_twr"], -0.05)
+        self.assertAlmostEqual(equity[1]["flow_frac"], -0.80)
+
+    def test_before_the_amendment_a_flow_is_at_the_start_of_the_interval(self):
+        equity, transfers, _, _ = self.withdrawal_day(valued_from="2099-01-01")
+        self.assertAlmostEqual(equity[1]["ret_twr"], 15 / 20 - 1)
+        self.assertNotIn("nav_before_frac", transfers[0])
+        self.assertEqual(pull.valuation_rows(transfers), [])
+
+    def test_a_deposit_is_valued_at_its_time(self):
+        t = self.at(self.D1, 12)
+        equity, _, _, _ = self.run_([rec(self.D0, 100), rec(self.D1, 231)],
+                                    [{"ts": t, "type": "TRANSFER", "amount": 100.0}], {t: 110.0})
+        self.assertAlmostEqual(equity[1]["ret_twr"], 1.1 * 1.1 - 1)
+
+    def test_two_flows_link_three_sub_periods(self):
+        t1, t2 = self.at(self.D1, 6), self.at(self.D1, 18)
+        equity, _, _, _ = self.run_([rec(self.D0, 100), rec(self.D1, 55)],
+                                    [{"ts": t1, "type": "TRANSFER", "amount": 50.0},
+                                     {"ts": t2, "type": "TRANSFER", "amount": -100.0}],
+                                    {t1: 105.0, t2: 150.0})
+        self.assertAlmostEqual(equity[1]["ret_twr"], 1.05 * (150 / 155) * (55 / 50) - 1)
+
+    def test_flows_sharing_a_time_are_one_flow(self):
+        t = self.at(self.D1, 8)
+        equity, transfers, _, _ = self.run_([rec(self.D0, 100), rec(self.D1, 15)],
+                                            [{"ts": t, "type": "TRANSFER", "amount": -30.0},
+                                             {"ts": t, "type": "TRANSFER", "amount": -50.0}],
+                                            {t: 95.0})
+        self.assertAlmostEqual(equity[1]["ret_twr"], -0.05)
+        self.assertEqual(len(transfers), 2)
+        self.assertEqual(len(pull.valuation_rows(transfers)), 1)
+
+    def test_the_value_before_the_flow_is_published_as_a_share(self):
+        _, transfers, _, _ = self.withdrawal_day()
+        self.assertAlmostEqual(transfers[0]["nav_before_frac"], 0.95)
+        self.assertEqual(pull.valuation_rows(transfers),
+                         [{"ts_utc": transfers[0]["ts_utc"], "nav_before_frac": transfers[0]["nav_before_frac"]}])
+
+    def test_a_flow_not_valued_at_its_time_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            self.run_([rec(self.D0, 100), rec(self.D1, 15)],
+                      [{"ts": self.at(self.D1, 8), "type": "TRANSFER", "amount": -80.0}], {})
+
+    def test_the_money_weighted_return_is_the_same_under_either_convention(self):
+        # The value path is the same; only the daily return differs. Rebuilt from the
+        # published ratios, both give that path, so both give the same rate.
+        t = self.at(self.D1, 8)
+        records = [rec(self.D0, 100), rec(self.D1, 15), rec(self.D2, 16.5)]
+        flows = [{"ts": t, "type": "TRANSFER", "amount": -80.0}]
+        old = self.run_(records, flows, {t: 95.0}, valued_from="2099-01-01")
+        new = self.run_(records, flows, {t: 95.0})
+        self.assertNotAlmostEqual(old[0][1]["ret_twr"], new[0][1]["ret_twr"])
+        mwr_old, _ = pull.money_weighted(old[0], old[1])
+        mwr_new, _ = pull.money_weighted(new[0], new[1])
+        self.assertIsNotNone(mwr_old)
+        self.assertAlmostEqual(mwr_old, mwr_new, places=9)
+
+
+class ValueAtAFlow(unittest.TestCase):
+    """NAV before a flow: the wallet moved by the ledger, the positions moved by the fills,
+    at the opening mark price of the flow's minute (section 2)."""
+
+    D0, D1 = "2026-11-01", "2026-11-02"
+
+    def doc(self, held, fills):
+        vos = [{"updateTime": mark(self.D0),
+                "data": {"assets": [{"asset": "USDT", "walletBalance": "1000", "marginBalance": "1000"}],
+                         "position": [{"symbol": "BTCUSDT", "positionAmt": str(size),
+                                       "entryPrice": str(entry), "markPrice": "1",
+                                       "unRealizedProfit": "0"} for size, entry in held]}},
+               {"updateTime": mark(self.D1),
+                "data": {"assets": [{"asset": "USDT", "walletBalance": "1", "marginBalance": "1"}],
+                         "position": []}}]
+        return {"daily_records_response": json.dumps({"snapshotVos": vos}),
+                "trade_responses": [json.dumps(list(fills))]}
+
+    def records(self):
+        return [rec(self.D0, 1000, wallet=1000), rec(self.D1, 1, wallet=1)]
+
+    def flow_at(self):
+        return pull.day_to_ms(self.D1) + 8 * 3_600_000 + 30_000
+
+    def ledger(self):
+        t = self.flow_at()
+        return [entry(self.D1, "REALIZED_PNL", 50, hour=3), entry(self.D1, "COMMISSION", -1, hour=3),
+                {"ts": t, "type": "TRANSFER", "amount": -500.0},
+                entry(self.D1, "REALIZED_PNL", -7, hour=10)]          # after the flow: not counted
+
+    def candle(self, open_price):
+        m = pull.mark_minute(self.flow_at())
+        return {m: [m, str(open_price), "0", "0", "0"]}
+
+    def test_the_value_is_the_wallet_and_the_positions_at_the_mark(self):
+        doc = self.doc([(0.1, 50_000)], [fill(1, self.D1, 3, "SELL", "LONG", 0.05, 51_000),
+                                         fill(2, self.D1, 10, "SELL", "LONG", 0.05, 51_000)])
+        values = pull.values_at_flows(doc, self.records(), self.ledger(), self.candle(52_000), self.D1)
+        self.assertAlmostEqual(values[self.flow_at()], 1000 + 50 - 1 + 0.05 * (52_000 - 50_000))
+
+    def test_a_short_side_is_valued_with_its_sign(self):
+        doc = self.doc([(-0.1, 50_000)], [])
+        values = pull.values_at_flows(doc, self.records(), self.ledger(), self.candle(49_000), self.D1)
+        self.assertAlmostEqual(values[self.flow_at()], 1000 + 50 - 1 + 0.1 * (50_000 - 49_000))
+
+    def test_a_flat_account_is_its_wallet_and_needs_no_mark(self):
+        values = pull.values_at_flows(self.doc([], []), self.records(), self.ledger(), {}, self.D1)
+        self.assertAlmostEqual(values[self.flow_at()], 1049.0)
+
+    def test_a_held_position_without_the_mark_of_its_minute_stops_the_run(self):
+        with self.assertRaises(SystemExit):
+            pull.values_at_flows(self.doc([(0.1, 50_000)], []), self.records(), self.ledger(), {}, self.D1)
+
+    def test_a_fill_of_no_side_stops_the_run(self):
+        doc = self.doc([(0.1, 50_000)], [fill(1, self.D1, 3, "SELL", "BOTH", 0.05, 51_000)])
+        with self.assertRaises(SystemExit):
+            pull.values_at_flows(doc, self.records(), self.ledger(), self.candle(52_000), self.D1)
+
+    def test_flows_before_the_amendment_are_not_valued(self):
+        self.assertEqual(pull.values_at_flows(self.doc([], []), self.records(), self.ledger(), {}, "2099-01-01"), {})
+        self.assertEqual(pull.flow_minutes(self.records(), self.ledger(), "2099-01-01"), [])
+        self.assertEqual(pull.flow_minutes(self.records(), self.ledger(), self.D1),
+                         [pull.mark_minute(self.flow_at())])
+
+
 if __name__ == "__main__":
     unittest.main()

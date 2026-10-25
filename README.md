@@ -102,6 +102,11 @@ of net asset value at the preceding valuation point, positive into the account; 
 `transfer` or `credit` (a rebate or reward paid by the exchange, counted as a flow and not as a
 return).
 
+**`data/flow_valuations.csv`.** From the valuation interval ending on 22 October 2026, net asset value
+immediately before each external cash flow: `ts_utc`, the flow's time; and `nav_before_frac`, the
+value as a fraction of net asset value at the preceding valuation point. A day's return links the
+sub-periods these values divide it into (Methodology, section 3).
+
 **`data/income_daily.csv`.** One row per UTC day: `realized_pnl_frac`, `costs_frac` (commissions and
 funding combined) and `other_frac`, each as a fraction of net asset value at the previous valuation
 point, with `other_types` naming the types grouped under `other_frac`.

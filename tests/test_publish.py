@@ -75,6 +75,7 @@ class Publication(unittest.TestCase):
         manifest = self.publish([(D1, 100), (D2, 110)])
         self.assertEqual(os.path.relpath(manifest, self.root), f"attest/{D2}.sha256")
         for rel in ("data/equity_daily.csv", "data/income_daily.csv", "data/transfers.csv",
+                    "data/flow_valuations.csv",
                     "data/monthly.csv", "data/corrections.csv", f"raw/{D1}/btc.json",
                     f"raw/{D2}/btc.json"):
             self.assertIn(rel, self.tree())
@@ -88,7 +89,7 @@ class Publication(unittest.TestCase):
         hashed_only = ("account/",)
         published = [rel for _, rel in self.manifest_lines(manifest)
                      if not rel.startswith(hashed_only)]
-        self.assertEqual(len(published), 7)
+        self.assertEqual(len(published), 8)
         for digest, rel in self.manifest_lines(manifest):
             if rel.startswith(hashed_only):
                 self.assertNotIn(rel, self.tree())          # hash only, never published
@@ -205,6 +206,76 @@ class Publication(unittest.TestCase):
         with open(os.path.join(self.root, "attest", f"{D2}.sha256"), "w") as f:
             f.write("already here\n")
         self.assertWritesNothing(lambda: self.publish([(D1, 100), (D2, 110)]))
+
+
+class DeclaredCorrections(unittest.TestCase):
+    """A published figure changes only by a declared correction, logged by the script (section 5)."""
+
+    D4 = "2026-03-04"
+    REASON = "a test correction"
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        saved = pull.CORRECTIONS
+        self.addCleanup(setattr, pull, "CORRECTIONS", saved)
+        pull.CORRECTIONS = [("data/equity_daily.csv", D2, ("ret_twr", "nav_idx", "ret_l1", "nav_l1_idx"),
+                             self.REASON)]
+
+    def publish(self, days):
+        return pull.publish(self.root, *series(days), PRIVATE)
+
+    def lines(self, rel):
+        with open(os.path.join(self.root, rel)) as f:
+            return f.read().splitlines()
+
+    def test_the_published_line_is_kept_and_the_correction_is_logged(self):
+        self.publish([(D1, 100), (D2, 110), (D3, 121)])
+        original = self.lines("data/equity_daily.csv")
+        manifest = self.publish([(D1, 100), (D2, 105), (D3, 121), (self.D4, 121)])
+        after = self.lines("data/equity_daily.csv")
+        self.assertEqual(after[:4], original)                       # as published
+        log = self.lines("data/corrections.csv")
+        self.assertEqual(log[0], ",".join(pull.CORRECTIONS_COLUMNS))
+        logged = {(r.split(",")[0], r.split(",")[2]) for r in log[1:]}
+        self.assertIn((D2, "ret_twr"), logged)
+        self.assertIn((D3, "ret_twr"), logged)                      # 105 -> 121 is a new return
+        self.assertNotIn((D3, "nav_idx"), logged)                   # 121 either way: unchanged
+        self.assertTrue(all(r.endswith(self.REASON) for r in log[1:]))
+        d2 = [r for r in log[1:] if r.startswith(f"{D2},data/equity_daily.csv,ret_twr,")][0]
+        self.assertIn("0.10000000,0.05000000,", d2)                 # published, corrected
+        self.assertIn("data/corrections.csv", [line.split("  ", 1)[1] for line in
+                                               open(manifest).read().splitlines()])
+
+    def test_a_later_run_computing_the_same_correction_logs_nothing_new(self):
+        self.publish([(D1, 100), (D2, 110), (D3, 121)])
+        self.publish([(D1, 100), (D2, 105), (D3, 121), (self.D4, 121)])
+        log = self.lines("data/corrections.csv")
+        self.publish([(D1, 100), (D2, 105), (D3, 121), (self.D4, 121), ("2026-03-05", 122)])
+        self.assertEqual(self.lines("data/corrections.csv"), log)
+
+    def test_a_logged_correction_computed_otherwise_writes_nothing(self):
+        self.publish([(D1, 100), (D2, 110), (D3, 121)])
+        self.publish([(D1, 100), (D2, 105), (D3, 121), (self.D4, 121)])
+        with self.assertRaises(SystemExit):
+            self.publish([(D1, 100), (D2, 106), (D3, 121), (self.D4, 121), ("2026-03-05", 122)])
+
+    def test_a_change_before_the_corrected_day_writes_nothing(self):
+        pull.CORRECTIONS = [("data/equity_daily.csv", D3, ("ret_twr", "nav_idx", "ret_l1", "nav_l1_idx"),
+                             self.REASON)]
+        self.publish([(D1, 100), (D2, 110), (D3, 121)])
+        before = self.lines("data/equity_daily.csv")
+        with self.assertRaises(SystemExit):
+            self.publish([(D1, 100), (D2, 105), (D3, 121), (self.D4, 121)])
+        self.assertEqual(self.lines("data/equity_daily.csv"), before)
+
+    def test_a_column_the_correction_does_not_name_writes_nothing(self):
+        self.publish([(D1, 100), (D2, 110), (D3, 121)])
+        days = [(D1, 100), (D2, 110), (D3, 121), (self.D4, 121)]
+        equity, transfers, income, monthly, bench = series(days)
+        equity[1]["version"] = "9.9"
+        with self.assertRaises(SystemExit):
+            pull.publish(self.root, equity, transfers, income, monthly, bench, PRIVATE)
 
 
 if __name__ == "__main__":

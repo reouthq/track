@@ -103,18 +103,37 @@ valuation interval in which its exchange timestamp falls, and $F_t$ denotes the 
 $t$. Realized P&L, commissions, funding and other income are internal to the Account and are not
 treated as cash flows.
 
+**Value at a cash flow.** The Account is also valued immediately before each external cash flow
+(section 3). `wallet` is the wallet balance of the preceding daily record moved by every income
+ledger entry before the flow; `unrealized` is computed as above for the positions of the preceding
+daily record moved by every fill before the flow, at the opening mark price of the minute that holds
+the flow in the exchange's public mark price history. Flows with the same exchange timestamp are one
+flow.
+
 **Aggregation.** Where more than one account is recorded in the account register, `wallet`,
 `unrealized`, `nav` and $F_t$ are aggregated across accounts as of the same Valuation Point, and the
 record is presented as a single series.
 
 ## 3. Returns and benchmark
 
-**Daily time-weighted return.** External cash flows are assumed to occur at the start of the
-valuation interval. This convention is fixed in advance and may not be revised retrospectively.
+**Daily time-weighted return.** Each external cash flow ends a sub-period of its valuation interval:
+the Account is valued immediately before the flow (section 2), and the next sub-period opens at that
+value plus the flow. The daily return links the sub-periods:
 
 $$
-r_t = \frac{\mathrm{NAV}_t}{\mathrm{NAV}_{t-1} + F_t} - 1
+1 + r_t = \prod_{k=0}^{K} \frac{V_{k+1}}{V_k + F_k}
 $$
+
+where $K$ is the number of flows in interval $t$, $V_0 = \mathrm{NAV}_{t-1}$ and $F_0 = 0$; for
+$k \ge 1$, $V_k$ is the value immediately before the $k$-th flow and $F_k$ the flow; and
+$V_{K+1} = \mathrm{NAV}_t$. Without a flow, $r_t = \mathrm{NAV}_t / \mathrm{NAV}_{t-1} - 1$. Each
+$V_k$ is published as a share of $\mathrm{NAV}_{t-1}$, so that the return can be reproduced.
+
+This applies to valuation intervals ending on or after 22 October 2026. Earlier intervals were
+computed under the convention then in force, which treated external cash flows as occurring at the
+start of the interval, $r_t = \mathrm{NAV}_t / (\mathrm{NAV}_{t-1} + F_t) - 1$, and are not
+recalculated. The interval ending 22 October 2026 was first published under that convention; its
+values, and the index values after it, are corrected in the log of corrections (section 5).
 
 Days on which an external cash flow occurred are identified in the Monthly Report, together with the
 timestamp of the flow.
