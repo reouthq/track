@@ -1,1 +1,7 @@
 date,file,column,published_value,corrected_value,reason
+2026-10-22,data/equity_daily.csv,ret_twr,-0.27647111,-0.04548896,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
+2026-10-22,data/equity_daily.csv,nav_idx,63.548998,83.836625,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
+2026-10-22,data/equity_daily.csv,ret_l1,-0.09215704,-0.01516299,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
+2026-10-22,data/equity_daily.csv,nav_l1_idx,87.068524,94.452794,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
+2026-10-23,data/equity_daily.csv,nav_idx,63.812806,84.184653,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
+2026-10-23,data/equity_daily.csv,nav_l1_idx,87.189005,94.583494,2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; the index values after it follow
