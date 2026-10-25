@@ -83,8 +83,8 @@ FLOW_VALUATION_FROM = "2026-10-22"
 # figure stops the run. A reason must not contain a comma.
 CORRECTIONS = [
     ("data/equity_daily.csv", "2026-10-22", ("ret_twr", "nav_idx", "ret_l1", "nav_l1_idx"),
-     "2026-10-22 recomputed with its two withdrawals valued at their times (Methodology section 3 "
-     "as amended 2026-10-25) instead of at the start of the day; the index values after it follow"),
+     "2026-10-22 recomputed under Methodology section 3 as amended 2026-10-25; "
+     "the index values after it follow"),
 ]
 
 # Entry prices rebuilt from fills are computed exactly; this only allows for the
