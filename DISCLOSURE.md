@@ -33,7 +33,7 @@ contact details in section 5.
 | Configuration | The hash of the sealed configuration, anchored before deployment | Model, parameters and filters |
 | Documents | The Methodology, the Disclosure, the Risk Limits, the registers, the incident and intervention logs, and corrections | — |
 | Operator | The name under which the Program is operated, and its official channels (section 5) | — |
-| Research | — | Research process, experimental results, rejected variants and development data |
+| Research | Research notes: findings on research practice and on markets, stated so as not to describe the thesis or the implementation (section 3) | The thesis and implementation behind any finding; experimental results that would identify the inputs, models, parameters, gates or a candidate change of a program; development data |
 
 Information is withheld where it would disclose the Program's current exposure or its
 implementation.
@@ -50,7 +50,9 @@ Information on the strategy's decision process is disclosed at three levels.
 
 Public materials on the strategy, including Monthly Reports and methodology notes, are confined to
 the strategy category and its measured properties, such as drawdown and correlation with the
-Benchmark. They do not describe the thesis.
+Benchmark. They do not describe the thesis. Research notes may report findings from reout's research, in a form that
+discloses neither the inputs, models, parameters, gates or execution rules of a program, nor a
+candidate change to one.
 
 Each deployed version is developed on data ending before it is deployed. All live results are
 therefore out of sample.
