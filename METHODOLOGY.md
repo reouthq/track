@@ -43,7 +43,7 @@ costs, a composite from which no account is excluded, and a disclosed benchmark.
 | Account Inception | The date of the first deposit into the Account, as recorded in the account register |
 | Record Inception | The Valuation Point at the end of the UTC day specified in the pre-registration manifest (section 7). The first daily return of the record is that of the following day |
 | Base currency | USDT. All published figures are returns or ratios. No currency conversion or adjustment for stablecoin risk is applied |
-| Leverage | Notional exposure of up to three times equity, compounded continuously. Long and short positions may be held concurrently |
+| Leverage | Notional exposure of up to three times current equity, so that returns compound. Long and short positions may be held concurrently |
 | Discretion | Entries, exits and position sizes are determined solely by the system. The only permitted manual actions are a suspension of new entries, the risk-reduction provision of the Risk Limits, section 4, and the venue failure procedure of the Risk Limits, section 5, each recorded in the intervention log when used. Any other manual action constitutes an intervention and is reported |
 
 A change to any term in this table other than Capital constitutes a change to the Program. Such a
@@ -104,10 +104,10 @@ $t$. Realized P&L, commissions, funding and other income are internal to the Acc
 treated as cash flows.
 
 **Value at a cash flow.** The Account is also valued immediately before each external cash flow
-(section 3). `wallet` is the wallet balance of the preceding daily record moved by every income
+(section 3). `wallet` is the wallet balance of the preceding daily record adjusted for every income
 ledger entry before the flow; `unrealized` is computed as above for the positions of the preceding
-daily record moved by every fill before the flow, at the opening mark price of the minute that holds
-the flow in the exchange's public mark price history. Flows with the same exchange timestamp are one
+daily record updated for every fill before the flow, at the opening mark price of the minute in which
+the flow falls, from the exchange's public mark price history. Flows with the same exchange timestamp are one
 flow.
 
 **Aggregation.** Where more than one account is recorded in the account register, `wallet`,
@@ -219,12 +219,12 @@ and the public website are generated from the official record by scripts maintai
 repository. In case of inconsistency, the official record prevails.
 
 **Monthly Report.** A report for each month (the "Monthly Report") is published on the third
-calendar day of the next, whatever the result, as plain text and as PDF. No month is omitted. It
+calendar day of the following month, whatever the result, as plain text and as PDF. No month is omitted. It
 sets out returns, risk statistics and the Benchmark comparison (sections 3 and 4), the position
 against the Risk Limits, the month's external cash flows and costs, the versions in effect, the
 outcome of reconciliation, changes and incidents, and the hashes of the month's files. Only the
-descriptions of changes, incidents, reviews and reconciliation differences are written rather than
-generated, and they are written at the time.
+descriptions of changes, incidents, reviews and reconciliation differences are written by hand rather than
+generated, and they are written as the events occur.
 
 **Reconciliation.** Each Monthly Report states whether three sources agree for the month:
 the record's ledger, reout's server ledger, and the exchange's own transaction statement for the
@@ -311,5 +311,5 @@ Former accounts remain in the ledger permanently.
 blockchain in the pre-registration manifest: the date of Record Inception, this Methodology, the
 Disclosure, the Risk Limits, reout's internal risk policy (hash only), the account register, the
 version register and the sealed configuration of the deployed strategy (hash only). Any subsequent
-change to the methodology, the deployed configuration or the thresholds is therefore independently
+change to the Methodology, the deployed configuration or the thresholds is therefore independently
 detectable.
